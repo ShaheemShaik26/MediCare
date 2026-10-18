@@ -1,0 +1,1 @@
+"""MediCare backend application package."""

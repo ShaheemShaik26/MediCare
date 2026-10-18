@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+.env.*
+!.env.example
+node_modules/
+frontend/dist/
+backend/.pytest_cache/
+backend/.coverage
+backend/*.db
+*.db
+medicare_test_*.db
+test_storage_*/
+storage/
+.DS_Store
