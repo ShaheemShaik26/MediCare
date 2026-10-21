@@ -1,4 +1,13 @@
-import type { DocumentRecord, MedicalFact, User } from '../types'
+import type {
+  DocumentRecord,
+  HealthTopic,
+  LifestyleProfile,
+  LifestyleProfileInput,
+  ManualFactType,
+  MedicalFact,
+  RecordsAnswer,
+  User,
+} from '../types'
 
 const API_BASE = '/api'
 
@@ -106,8 +115,7 @@ export async function downloadDocument(documentId: number, fileName: string): Pr
     credentials: 'same-origin',
   })
   if (!response.ok) {
-    const text = await response.text()
-    throw new Error(text || 'Unable to download this document')
+    throw await responseError(response)
   }
 
   const blob = await response.blob()
@@ -117,6 +125,31 @@ export async function downloadDocument(documentId: number, fileName: string): Pr
   anchor.download = fileName
   anchor.click()
   window.setTimeout(() => URL.revokeObjectURL(url), 1000)
+}
+
+export async function viewDocument(documentId: number): Promise<void> {
+  const preview = window.open('about:blank', '_blank')
+  if (!preview) {
+    throw new Error('Your browser blocked the document preview. Allow pop-ups for this site and try again.')
+  }
+  preview.opener = null
+  preview.document.title = 'Loading health record…'
+
+  try {
+    const response = await fetch(`${API_BASE}/documents/${documentId}/download`, {
+      credentials: 'same-origin',
+    })
+    if (!response.ok) {
+      throw await responseError(response)
+    }
+
+    const url = URL.createObjectURL(await response.blob())
+    preview.location.replace(url)
+    window.setTimeout(() => URL.revokeObjectURL(url), 60_000)
+  } catch (error) {
+    preview.close()
+    throw error
+  }
 }
 
 export async function uploadDocument(file: File): Promise<DocumentRecord> {
@@ -146,14 +179,76 @@ export async function getDocumentFacts(documentId: number): Promise<MedicalFact[
   return apiFetch<MedicalFact[]>(`/documents/${documentId}/facts`)
 }
 
-export async function reviewFact(factId: number, status: 'accepted' | 'rejected' | 'unreviewed'): Promise<MedicalFact> {
+export async function extractDocumentFacts(documentId: number): Promise<{
+  document_id: number
+  extracted_fact_count: number
+  updated_fact_count: number
+  status: string
+}> {
+  return apiFetch(`/documents/${documentId}/extract`, { method: 'POST' })
+}
+
+export async function createManualFact(
+  documentId: number,
+  payload: {
+    fact_type: ManualFactType
+    value: string
+    event_date: string | null
+    page_number: number | null
+  },
+): Promise<MedicalFact> {
+  return apiFetch<MedicalFact>(`/documents/${documentId}/facts`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  })
+}
+
+export async function reviewFact(
+  factId: number,
+  payload: {
+    status: 'accepted' | 'rejected' | 'unreviewed'
+    fact_type?: string
+    value?: string
+    event_date?: string | null
+    clear_event_date?: boolean
+  },
+): Promise<MedicalFact> {
   return apiFetch<MedicalFact>(`/facts/${factId}/review`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ status }),
+    body: JSON.stringify(payload),
   })
 }
 
 export async function getTimeline(): Promise<MedicalFact[]> {
   return apiFetch<MedicalFact[]>('/timeline')
+}
+
+export async function getLifestyleProfile(): Promise<LifestyleProfile | null> {
+  return apiFetch<LifestyleProfile | null>('/lifestyle')
+}
+
+export async function saveLifestyleProfile(profile: LifestyleProfileInput): Promise<LifestyleProfile> {
+  return apiFetch<LifestyleProfile>('/lifestyle', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(profile),
+  })
+}
+
+export async function askRecordsQuestion(question: string): Promise<RecordsAnswer> {
+  return apiFetch<RecordsAnswer>('/records/ask', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ question }),
+  })
+}
+
+export async function searchHealthKnowledge(query: string): Promise<HealthTopic[]> {
+  return apiFetch<HealthTopic[]>('/knowledge/search', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ query }),
+  })
 }

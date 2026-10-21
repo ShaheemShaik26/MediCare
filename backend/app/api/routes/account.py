@@ -17,7 +17,7 @@ from sqlalchemy.orm import Session
 from app.config import UPLOAD_DIR, settings
 from app.database import get_db
 from app.deps import CSRF_COOKIE_NAME, SESSION_COOKIE_NAME, get_current_user
-from app.models.user import Document, MedicalFact, User
+from app.models.user import Document, LifestyleProfile, MedicalFact, User
 from app.schemas.account import AccountDeleteRequest
 from app.services.auth_service import verify_password
 from app.services.document_service import sanitize_filename
@@ -50,6 +50,11 @@ def export_account(
         .filter(MedicalFact.owner_id == current_user.id)
         .order_by(MedicalFact.id)
         .all()
+    )
+    lifestyle_profile = (
+        db.query(LifestyleProfile)
+        .filter(LifestyleProfile.owner_id == current_user.id)
+        .first()
     )
 
     export_dir = Path(tempfile.mkdtemp(prefix="medicare_export_", dir=UPLOAD_DIR))
@@ -87,10 +92,26 @@ def export_account(
                 "confidence": fact.confidence,
                 "source_excerpt": fact.source_excerpt,
                 "page_number": fact.page_number,
+                "event_date": fact.event_date.isoformat() if fact.event_date else None,
+                "numeric_value": fact.numeric_value,
+                "unit": fact.unit,
                 "created_at": fact.created_at.isoformat(),
             }
             for fact in facts
         ],
+        "lifestyle_profile": (
+            {
+                "activity_frequency": lifestyle_profile.activity_frequency,
+                "diet_notes": lifestyle_profile.diet_notes,
+                "sleep_hours": lifestyle_profile.sleep_hours,
+                "tobacco_use": lifestyle_profile.tobacco_use,
+                "alcohol_frequency": lifestyle_profile.alcohol_frequency,
+                "notes": lifestyle_profile.notes,
+                "updated_at": lifestyle_profile.updated_at.isoformat(),
+            }
+            if lifestyle_profile
+            else None
+        ),
         "exported_at": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -141,6 +162,9 @@ def delete_account(
         os.replace(user_storage, quarantine_path)
 
     try:
+        db.query(LifestyleProfile).filter(LifestyleProfile.owner_id == current_user.id).delete(
+            synchronize_session=False
+        )
         db.query(MedicalFact).filter(MedicalFact.owner_id == current_user.id).delete(synchronize_session=False)
         db.query(Document).filter(Document.owner_id == current_user.id).delete(synchronize_session=False)
         db.delete(current_user)

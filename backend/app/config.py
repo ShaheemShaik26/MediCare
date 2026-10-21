@@ -19,6 +19,9 @@ class Settings(BaseSettings):
     tesseract_cmd: str = "tesseract"
     ocr_languages: str = "eng"
     ocr_enabled: bool = True
+    medical_ner_enabled: bool = True
+    medical_ner_model: str = "d4data/biomedical-ner-all"
+    medical_ner_min_score: float = Field(default=0.85, ge=0.0, le=1.0)
     cors_origins: str = "http://localhost:5173"
     secure_cookies: bool = True
 

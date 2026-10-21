@@ -12,6 +12,8 @@ from fastapi.responses import JSONResponse, Response
 from app.api.routes.account import router as account_router
 from app.api.routes.auth import router as auth_router
 from app.api.routes.documents import router as documents_router
+from app.api.routes.lifestyle import router as lifestyle_router
+from app.api.routes.knowledge import router as knowledge_router
 from app.config import settings
 
 
@@ -20,6 +22,7 @@ _RATE_LIMITS = {
     "/api/auth/login": (10, 60),
     "/api/auth/register": (5, 60 * 60),
     "/api/documents/upload": (20, 60),
+    "/api/knowledge/search": (10, 60),
 }
 _rate_limit_entries: OrderedDict[tuple[str, str], tuple[float, int]] = OrderedDict()
 _rate_limit_lock = Lock()
@@ -145,6 +148,8 @@ async def harden_api_requests(request: Request, call_next):
 app.include_router(auth_router)
 app.include_router(account_router)
 app.include_router(documents_router)
+app.include_router(lifestyle_router)
+app.include_router(knowledge_router)
 
 
 @app.get("/api/health")

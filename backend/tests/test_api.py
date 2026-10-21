@@ -20,6 +20,7 @@ os.environ["DATABASE_URL"] = f"sqlite:///{test_db}"
 os.environ["SECRET_KEY"] = "test-secret-key-0123456789abcdef"
 os.environ["UPLOAD_DIR"] = str(test_storage)
 os.environ["SECURE_COOKIES"] = "false"
+os.environ["MEDICAL_NER_ENABLED"] = "false"
 
 migration_config = Config(str(ROOT / "backend" / "alembic.ini"))
 migration_config.set_main_option("sqlalchemy.url", os.environ["DATABASE_URL"].replace("%", "%%"))
@@ -202,7 +203,10 @@ def test_document_upload_and_timeline():
 
     payload = (
         b"Visit Summary\nProvider: Dr. Sarah Chen\nDate: 2025-09-15\n"
-        b"Diagnosis: Type 2 diabetes. Medication: Metformin 500 mg twice daily. Allergy: Penicillin."
+        b"Event date: September 14, 2025\n"
+        b"Diagnosis: Type 2 diabetes. Medication: Metformin 500 mg twice daily. Allergy: Penicillin.\n"
+        b"HbA1c: 6.8 %\nExercise: Walking 30 minutes most days.\n"
+        b"Tobacco use: Never.\nDiet: Mostly home-cooked meals.\nAlcohol use: Occasionally.\nSleep duration: 7 hours."
     )
     upload = client.post(
         "/api/documents/upload",
@@ -220,15 +224,33 @@ def test_document_upload_and_timeline():
     assert facts.status_code == 200, facts.text
     items = facts.json()
     assert any(item["fact_type"] == "diagnosis" for item in items)
+    assert any(item["fact_type"] == "medication" and "Metformin" in item["value"] for item in items)
+    assert any(item["fact_type"] == "allergy" and "Penicillin" in item["value"] for item in items)
+    assert any(item["fact_type"] == "lifestyle_activity" for item in items)
+    assert any(item["fact_type"] == "lifestyle_tobacco" for item in items)
+    assert any(item["fact_type"] == "lifestyle_diet" for item in items)
+    assert any(item["fact_type"] == "lifestyle_alcohol" for item in items)
+    assert any(item["fact_type"] == "lifestyle_sleep" for item in items)
+    hba1c = next(item for item in items if item["fact_type"] == "lab")
+    assert hba1c["numeric_value"] == 6.8
+    assert hba1c["unit"] == "%"
+    assert hba1c["event_date"] == "2025-09-14"
 
-    fact_id = items[0]["id"]
+    diagnosis = next(item for item in items if item["fact_type"] == "diagnosis")
     review = client.post(
-        f"/api/facts/{fact_id}/review",
+        f"/api/facts/{diagnosis['id']}/review",
         headers=headers,
-        json={"status": "accepted"},
+        json={
+            "status": "accepted",
+            "fact_type": "diagnosis",
+            "value": "Type 2 diabetes (reviewed)",
+            "event_date": "2025-09-14",
+        },
     )
     assert review.status_code == 200, review.text
     assert review.json()["status"] == "accepted"
+    assert review.json()["value"] == "Type 2 diabetes (reviewed)"
+    assert review.json()["event_date"] == "2025-09-14"
 
     timeline = client.get("/api/timeline", headers=headers)
     assert timeline.status_code == 200, timeline.text
@@ -238,6 +260,482 @@ def test_document_upload_and_timeline():
     assert download.status_code == 200
     assert download.content == payload
     assert download.headers["cache-control"] == "private, no-store"
+
+
+def test_manual_fact_from_document_appears_on_timeline_before_confirmation():
+    email = f"manual-fact-{uuid.uuid4().hex}@example.com"
+    register = client.post(
+        "/api/auth/register",
+        json={"email": email, "password": "StrongPass123!", "full_name": "Manual Fact"},
+    )
+    assert register.status_code == 200, register.text
+    token = login_token(email, "StrongPass123!")
+    headers = {"Authorization": "Bearer " + token}
+
+    upload = client.post(
+        "/api/documents/upload",
+        files={"file": ("scan.txt", b"Document reviewed manually.", "text/plain")},
+        headers=headers,
+    )
+    assert upload.status_code == 200, upload.text
+    document_id = upload.json()["id"]
+
+    created = client.post(
+        f"/api/documents/{document_id}/facts",
+        headers=headers,
+        json={
+            "fact_type": "lab",
+            "value": "HbA1c: 6.8 %",
+            "event_date": "2025-01-12",
+            "page_number": 1,
+        },
+    )
+    assert created.status_code == 201, created.text
+    fact = created.json()
+    assert fact["status"] == "unreviewed"
+    assert fact["event_date"] == "2025-01-12"
+    assert fact["page_number"] == 1
+    assert fact["source_excerpt"].startswith("User-entered from scan.txt")
+    assert fact["numeric_value"] == 6.8
+    assert fact["unit"] == "%"
+    initial_timeline = client.get("/api/timeline", headers=headers)
+    assert initial_timeline.status_code == 200
+    assert [item["id"] for item in initial_timeline.json()] == [fact["id"]]
+    original_source_excerpt = fact["source_excerpt"]
+
+    edited = client.post(
+        f"/api/facts/{fact['id']}/review",
+        headers=headers,
+        json={
+            "status": "unreviewed",
+            "value": "HbA1c: 6.9 %",
+            "event_date": "2025-01-13",
+        },
+    )
+    assert edited.status_code == 200, edited.text
+    assert edited.json()["status"] == "unreviewed"
+    assert edited.json()["source_excerpt"] == original_source_excerpt
+    assert edited.json()["value"] == "HbA1c: 6.9 %"
+    assert edited.json()["event_date"] == "2025-01-13"
+    assert client.get("/api/timeline", headers=headers).json()[0]["value"] == "HbA1c: 6.9 %"
+
+    accepted = client.post(
+        f"/api/facts/{fact['id']}/review",
+        headers=headers,
+        json={"status": "accepted"},
+    )
+    assert accepted.status_code == 200, accepted.text
+    timeline = client.get("/api/timeline", headers=headers)
+    assert timeline.status_code == 200
+    assert timeline.json()[0]["value"] == "HbA1c: 6.9 %"
+    assert timeline.json()[0]["event_date"] == "2025-01-13"
+
+    rejected = client.post(
+        f"/api/documents/{document_id}/facts",
+        headers=headers,
+        json={"fact_type": "symptom", "value": "Unwanted extracted detail"},
+    )
+    assert rejected.status_code == 201
+    assert client.post(
+        f"/api/facts/{rejected.json()['id']}/review",
+        headers=headers,
+        json={"status": "rejected"},
+    ).status_code == 200
+    final_timeline = client.get("/api/timeline", headers=headers)
+    assert [item["id"] for item in final_timeline.json()] == [fact["id"]]
+
+    blank = client.post(
+        f"/api/documents/{document_id}/facts",
+        headers=headers,
+        json={"fact_type": "lab", "value": "   "},
+    )
+    assert blank.status_code == 422
+
+    other_email = f"manual-fact-other-{uuid.uuid4().hex}@example.com"
+    client.post(
+        "/api/auth/register",
+        json={"email": other_email, "password": "StrongPass123!", "full_name": "Other User"},
+    )
+    other_headers = {"Authorization": "Bearer " + login_token(other_email, "StrongPass123!")}
+    unauthorized = client.post(
+        f"/api/documents/{document_id}/facts",
+        headers=other_headers,
+        json={"fact_type": "lab", "value": "Not authorized"},
+    )
+    assert unauthorized.status_code == 404
+
+
+def test_existing_document_can_be_reextracted_without_duplicate_facts(monkeypatch):
+    from app.api.routes import documents as document_routes
+    from app.services.document_service import ExtractedFactCandidate
+
+    email = f"reextract-{uuid.uuid4().hex}@example.com"
+    register = client.post(
+        "/api/auth/register",
+        json={"email": email, "password": "StrongPass123!", "full_name": "Re-extract"},
+    )
+    assert register.status_code == 200, register.text
+    headers = {"Authorization": "Bearer " + login_token(email, "StrongPass123!")}
+    upload = client.post(
+        "/api/documents/upload",
+        files={"file": ("older.txt", b"Previously uploaded clinical record.", "text/plain")},
+        headers=headers,
+    )
+    assert upload.status_code == 200, upload.text
+    document_id = upload.json()["id"]
+
+    candidate = ExtractedFactCandidate(
+        fact_type="diagnosis",
+        value="Asthma",
+        confidence=0.8,
+        source_excerpt="Diagnosis: Asthma",
+        page_number=1,
+        event_date=None,
+        numeric_value=None,
+        unit=None,
+    )
+    monkeypatch.setattr(document_routes, "extract_fact_candidates", lambda *args: [candidate])
+
+    response = client.post(f"/api/documents/{document_id}/extract", headers=headers)
+    assert response.status_code == 200, response.text
+    assert response.json()["extracted_fact_count"] == 1
+    timeline = client.get("/api/timeline", headers=headers)
+    assert timeline.status_code == 200
+    assert len(timeline.json()) == 1
+    assert timeline.json()[0]["status"] == "unreviewed"
+    assert timeline.json()[0]["source_excerpt"] == "Diagnosis: Asthma"
+
+    repeated = client.post(f"/api/documents/{document_id}/extract", headers=headers)
+    assert repeated.status_code == 200, repeated.text
+    assert repeated.json()["extracted_fact_count"] == 0
+    assert len(client.get("/api/timeline", headers=headers).json()) == 1
+
+    other_email = f"reextract-other-{uuid.uuid4().hex}@example.com"
+    client.post(
+        "/api/auth/register",
+        json={"email": other_email, "password": "StrongPass123!", "full_name": "Other User"},
+    )
+    other_headers = {"Authorization": "Bearer " + login_token(other_email, "StrongPass123!")}
+    unauthorized = client.post(f"/api/documents/{document_id}/extract", headers=other_headers)
+    assert unauthorized.status_code == 404
+
+
+def test_extraction_handles_common_lab_rows_and_keeps_compound_values_intact():
+    email = f"extraction-{uuid.uuid4().hex}@example.com"
+    client.post(
+        "/api/auth/register",
+        json={"email": email, "password": "StrongPass123!", "full_name": "Extraction Review"},
+    )
+    token = login_token(email, "StrongPass123!")
+    headers = {"Authorization": "Bearer " + token}
+    content = (
+        b"Lab Results\nDate of Birth: 1985-01-01\nCollection date: 10/06/2025\n"
+        b"WBC 6.2 x10^9/L\nHemoglobin 13.4 g/dL\n"
+        b"Blood Pressure 120/80 mmHg\n"
+        b"Glucose = 100 mg/dL\n"
+        b"Medication: Metformin 500 mg on 2025-01-02\n"
+        b"Symptoms: occasional dizziness\n"
+        b"Exercise frequency: 3 days/week\n"
+    )
+    upload = client.post(
+        "/api/documents/upload",
+        files={"file": ("lab-results.txt", content, "text/plain")},
+        headers=headers,
+    )
+    assert upload.status_code == 200, upload.text
+    assert upload.json()["document_date"] == "10/06/2025"
+    facts = client.get(f"/api/documents/{upload.json()['id']}/facts", headers=headers)
+    assert facts.status_code == 200, facts.text
+    items = facts.json()
+    wbc = next(item for item in items if item["value"].startswith("WBC:"))
+    hemoglobin = next(item for item in items if item["value"].startswith("Hemoglobin:"))
+    blood_pressure = next(item for item in items if item["value"].startswith("Blood Pressure:"))
+    glucose = next(item for item in items if item["value"].startswith("Glucose:"))
+    medication = next(item for item in items if item["fact_type"] == "medication")
+    symptom = next(item for item in items if item["fact_type"] == "symptom")
+    activity = next(item for item in items if item["fact_type"] == "lifestyle_activity")
+
+    assert wbc["numeric_value"] == 6.2
+    assert wbc["unit"] == "x10^9/L"
+    assert hemoglobin["numeric_value"] == 13.4
+    assert hemoglobin["unit"] == "g/dL"
+    assert blood_pressure["value"] == "Blood Pressure: 120/80 mmHg"
+    assert blood_pressure["numeric_value"] is None
+    assert glucose["numeric_value"] == 100
+    assert glucose["unit"] == "mg/dL"
+    assert medication["value"] == "Metformin 500 mg on 2025-01-02"
+    assert symptom["value"] == "occasional dizziness"
+    assert activity["value"] == "3 days/week"
+    assert all(
+        item["event_date"] == "2025-10-06"
+        for item in (wbc, hemoglobin, blood_pressure, glucose, medication, symptom, activity)
+    )
+
+    sentence_upload = client.post(
+        "/api/documents/upload",
+        files={
+            "file": (
+                "sentence-record.txt",
+                b"Medication: Metformin 500 mg twice daily. The patient reports intermittent dizziness.",
+                "text/plain",
+            )
+        },
+        headers=headers,
+    )
+    assert sentence_upload.status_code == 200, sentence_upload.text
+    sentence_facts = client.get(
+        f"/api/documents/{sentence_upload.json()['id']}/facts",
+        headers=headers,
+    )
+    assert sentence_facts.status_code == 200
+    sentence_medication = next(
+        item for item in sentence_facts.json() if item["fact_type"] == "medication"
+    )
+    assert sentence_medication["value"] == "Metformin 500 mg twice daily."
+    assert "dizziness" not in sentence_medication["value"]
+
+    ambiguous_dates = client.post(
+        "/api/documents/upload",
+        files={
+            "file": (
+                "multi-date.txt",
+                b"Event date: 2025-01-01\nDiagnosis: Asthma\nCollection date: 2025-02-02\nGlucose: 95 mg/dL",
+                "text/plain",
+            )
+        },
+        headers=headers,
+    )
+    assert ambiguous_dates.status_code == 200, ambiguous_dates.text
+    ambiguous_facts = client.get(
+        f"/api/documents/{ambiguous_dates.json()['id']}/facts",
+        headers=headers,
+    )
+    assert ambiguous_facts.status_code == 200
+    ambiguous_items = ambiguous_facts.json()
+    diagnosis = next(item for item in ambiguous_items if item["fact_type"] == "diagnosis")
+    glucose = next(item for item in ambiguous_items if item["value"].startswith("Glucose:"))
+    assert diagnosis["event_date"] == "2025-01-01"
+    assert glucose["event_date"] == "2025-02-02"
+    assert diagnosis["document_id"] == ambiguous_dates.json()["id"]
+    assert diagnosis["page_number"] == 1
+    assert diagnosis["source_excerpt"] == "Diagnosis: Asthma"
+
+    accepted = client.post(
+        f"/api/facts/{activity['id']}/review",
+        headers=headers,
+        json={"status": "accepted"},
+    )
+    assert accepted.status_code == 200
+    timeline = client.get("/api/timeline", headers=headers)
+    assert timeline.status_code == 200
+    assert any(item["id"] == activity["id"] for item in timeline.json())
+
+
+def test_pdf_table_extraction_preserves_lab_row_values():
+    import pymupdf
+
+    from app.services.document_service import extract_document_pages
+
+    document = pymupdf.open()
+    page = document.new_page()
+    x_positions = (50, 170, 280)
+    y_positions = (50, 80, 110)
+    for x_position in x_positions:
+        page.draw_line((x_position, y_positions[0]), (x_position, y_positions[-1]))
+    for y_position in y_positions:
+        page.draw_line((x_positions[0], y_position), (x_positions[-1], y_position))
+    page.insert_text((60, 70), "HbA1c")
+    page.insert_text((180, 70), "6.8 %")
+    page.insert_text((60, 100), "Glucose")
+    page.insert_text((180, 100), "100 mg/dL")
+    content = document.tobytes()
+    document.close()
+
+    extracted = extract_document_pages(content, "application/pdf")
+
+    assert "HbA1c\t6.8 %" in extracted.pages[0]
+    assert "Glucose\t100 mg/dL" in extracted.pages[0]
+
+
+def test_local_ner_candidates_are_unreviewed_cited_and_never_auto_accepted(monkeypatch):
+    from app.config import settings
+    from app.services import document_service
+    from app.services.medical_ner_service import MedicalEntity
+
+    monkeypatch.setattr(settings, "medical_ner_enabled", True)
+    monkeypatch.setattr(
+        document_service,
+        "recognize_medical_entities",
+        lambda text: [
+            MedicalEntity("Disease_disorder", "asthma", 0.96, "History of asthma noted during this visit."),
+            MedicalEntity("Sign_symptom", "shortness of breath", 0.91, "Reports shortness of breath after exertion."),
+            MedicalEntity("Sign_symptom", "headache", 0.91, "Reports headaches after activity."),
+            MedicalEntity("Medication", "albuterol", 0.89, "Uses albuterol as needed."),
+            MedicalEntity("Medication", "medication", 0.99, "Medication: albuterol as needed."),
+            MedicalEntity("Medication", "li", 0.99, "Treatment includes lisinopril."),
+            MedicalEntity("Medication", "##sin", 0.99, "Treatment includes lisinopril."),
+            MedicalEntity("Date", "2025-04-02", 0.99, "Encounter date: 2025-04-02."),
+            MedicalEntity("Disease_disorder", "low score condition", 0.72, "A low score condition."),
+        ],
+    )
+    email = f"ner-{uuid.uuid4().hex}@example.com"
+    client.post(
+        "/api/auth/register",
+        json={"email": email, "password": "StrongPass123!", "full_name": "NER Review"},
+    )
+    token = login_token(email, "StrongPass123!")
+    headers = {"Authorization": "Bearer " + token}
+    upload = client.post(
+        "/api/documents/upload",
+        files={
+            "file": (
+                "narrative.txt",
+                b"Clinical note\nEncounter date: 2025-04-02\nNo additional explicitly labeled facts.",
+                "text/plain",
+            )
+        },
+        headers=headers,
+    )
+    assert upload.status_code == 200, upload.text
+    facts = client.get(f"/api/documents/{upload.json()['id']}/facts", headers=headers)
+    assert facts.status_code == 200
+    items = facts.json()
+    assert {item["fact_type"] for item in items} == {"diagnosis", "symptom", "medication"}
+    assert any(item["value"] == "headache" for item in items)
+    assert all(item["status"] == "unreviewed" for item in items)
+    assert all(item["source_excerpt"].startswith("AI suggestion:") for item in items)
+    assert all(item["event_date"] == "2025-04-02" for item in items)
+    timeline = client.get("/api/timeline", headers=headers)
+    assert timeline.status_code == 200
+    assert {item["id"] for item in timeline.json()} == {item["id"] for item in items}
+
+
+def test_records_question_returns_citations_conflicts_and_insufficient_evidence():
+    email = f"records-qa-{uuid.uuid4().hex}@example.com"
+    client.post(
+        "/api/auth/register",
+        json={"email": email, "password": "StrongPass123!", "full_name": "Records Q&A"},
+    )
+    token = login_token(email, "StrongPass123!")
+    headers = {"Authorization": "Bearer " + token}
+
+    documents = []
+    for file_name, content in (
+        ("record-one.txt", b"Event date: 2024-02-01\nDiagnosis: Type 2 diabetes."),
+        ("record-two.txt", b"Event date: 2025-06-12\nDiagnosis: Type 1 diabetes."),
+    ):
+        upload = client.post(
+            "/api/documents/upload",
+            files={"file": (file_name, content, "text/plain")},
+            headers=headers,
+        )
+        assert upload.status_code == 200, upload.text
+        document_id = upload.json()["id"]
+        documents.append(document_id)
+        facts = client.get(f"/api/documents/{document_id}/facts", headers=headers)
+        assert facts.status_code == 200
+        for fact in facts.json():
+            accepted = client.post(
+                f"/api/facts/{fact['id']}/review",
+                headers=headers,
+                json={"status": "accepted"},
+            )
+            assert accepted.status_code == 200
+
+    answer = client.post(
+        "/api/records/ask",
+        headers=headers,
+        json={"question": "What diagnosis is in my records?"},
+    )
+    assert answer.status_code == 200, answer.text
+    result = answer.json()
+    assert result["insufficient_evidence"] is False
+    assert result["possible_conflict"] is True
+    assert len(result["citations"]) == 2
+    assert {citation["document_id"] for citation in result["citations"]} == set(documents)
+    assert {citation["event_date"] for citation in result["citations"]} == {"2024-02-01", "2025-06-12"}
+    timeline = client.get("/api/timeline", headers=headers)
+    assert timeline.status_code == 200
+    assert [item["event_date"] for item in timeline.json()] == ["2025-06-12", "2024-02-01"]
+
+    missing = client.post(
+        "/api/records/ask",
+        headers=headers,
+        json={"question": "What medication did I take?"},
+    )
+    assert missing.status_code == 200
+    assert missing.json()["insufficient_evidence"] is True
+    assert missing.json()["citations"] == []
+    assert "does not mean" in missing.json()["answer"]
+
+    unauthenticated = client.post(
+        "/api/records/ask",
+        json={"question": "What diagnosis is in my records?"},
+    )
+    assert unauthenticated.status_code == 401
+
+    other_email = f"records-qa-other-{uuid.uuid4().hex}@example.com"
+    client.post(
+        "/api/auth/register",
+        json={"email": other_email, "password": "StrongPass123!", "full_name": "Other Records Owner"},
+    )
+    other_token = login_token(other_email, "StrongPass123!")
+    other_answer = client.post(
+        "/api/records/ask",
+        headers={"Authorization": "Bearer " + other_token},
+        json={"question": "What diagnosis is in my records?"},
+    )
+    assert other_answer.status_code == 200
+    assert other_answer.json()["insufficient_evidence"] is True
+    assert other_answer.json()["citations"] == []
+
+
+def test_lifestyle_profile_is_private_persisted_and_validated():
+    email = f"lifestyle-{uuid.uuid4().hex}@example.com"
+    client.post(
+        "/api/auth/register",
+        json={"email": email, "password": "StrongPass123!", "full_name": "Lifestyle Owner"},
+    )
+    token = login_token(email, "StrongPass123!")
+    headers = {"Authorization": "Bearer " + token}
+
+    empty_profile = client.get("/api/lifestyle", headers=headers)
+    assert empty_profile.status_code == 200
+    assert empty_profile.json() is None
+
+    payload = {
+        "activity_frequency": "3-4 days/week",
+        "diet_notes": "Mostly home-cooked meals",
+        "sleep_hours": 7.5,
+        "tobacco_use": "prefer_not_to_say",
+        "alcohol_frequency": "occasionally",
+        "notes": None,
+    }
+    saved = client.put("/api/lifestyle", json=payload, headers=headers)
+    assert saved.status_code == 200, saved.text
+    assert {key: saved.json()[key] for key in payload} == payload
+
+    persisted = client.get("/api/lifestyle", headers=headers)
+    assert persisted.status_code == 200
+    assert {key: persisted.json()[key] for key in payload} == payload
+    assert persisted.json()["updated_at"]
+
+    invalid = client.put(
+        "/api/lifestyle",
+        json={**payload, "sleep_hours": 25},
+        headers=headers,
+    )
+    assert invalid.status_code == 422
+
+    other_email = f"lifestyle-other-{uuid.uuid4().hex}@example.com"
+    client.post(
+        "/api/auth/register",
+        json={"email": other_email, "password": "StrongPass123!", "full_name": "Other Owner"},
+    )
+    other_token = login_token(other_email, "StrongPass123!")
+    other_profile = client.get("/api/lifestyle", headers={"Authorization": "Bearer " + other_token})
+    assert other_profile.status_code == 200
+    assert other_profile.json() is None
 
 
 def test_upload_validation_and_private_document_download():
@@ -459,6 +957,19 @@ def test_account_export_and_password_confirmed_deletion():
     )
     assert upload.status_code == 200, upload.text
     document_id = upload.json()["id"]
+    lifestyle = client.put(
+        "/api/lifestyle",
+        headers=headers,
+        json={
+            "activity_frequency": "rarely",
+            "diet_notes": None,
+            "sleep_hours": 8,
+            "tobacco_use": "never",
+            "alcohol_frequency": None,
+            "notes": None,
+        },
+    )
+    assert lifestyle.status_code == 200, lifestyle.text
 
     export = client.get("/api/account/export", headers=headers)
     assert export.status_code == 200
@@ -470,6 +981,7 @@ def test_account_export_and_password_confirmed_deletion():
         assert "password_hash" not in records["account"]
         assert records["documents"][0]["id"] == document_id
         assert archive.read(f"documents/{document_id}_summary.txt") == b"Diagnosis: asthma"
+        assert records["lifestyle_profile"]["tobacco_use"] == "never"
 
     bad_password = client.request(
         "DELETE",
@@ -487,6 +999,7 @@ def test_account_export_and_password_confirmed_deletion():
     )
     assert deletion.status_code == 204
     assert client.get("/api/auth/me", headers=headers).status_code == 401
+    assert client.get("/api/lifestyle", headers=headers).status_code == 401
     assert not (test_storage / f"user_{records['account']['id']}").exists()
 
 
@@ -512,3 +1025,102 @@ def test_user_scope_protection():
 
     other = client.get(f"/api/documents/{doc_id}/facts", headers={"Authorization": f"Bearer {token_b}"})
     assert other.status_code == 404, other.text
+
+
+def test_medlineplus_search_requires_auth_and_returns_attributed_topics(monkeypatch):
+    from app.api.routes import knowledge
+    from app.schemas.knowledge import HealthTopic
+    from app.services.medlineplus_service import MedicalKnowledgeUnavailable
+
+    unauthenticated = client.post("/api/knowledge/search", json={"query": "blood pressure"})
+    assert unauthenticated.status_code == 401
+
+    email = f"knowledge-{uuid.uuid4().hex}@example.com"
+    client.post(
+        "/api/auth/register",
+        json={"email": email, "password": "StrongPass123!", "full_name": "Knowledge Search"},
+    )
+    token = login_token(email, "StrongPass123!")
+    headers = {"Authorization": "Bearer " + token}
+    sent_queries = []
+
+    def search(query):
+        sent_queries.append(query)
+        return [HealthTopic(
+            title="Blood Pressure",
+            summary="A public health topic.",
+            url="https://medlineplus.gov/bloodpressure.html",
+            source="MedlinePlus.gov",
+        )]
+
+    monkeypatch.setattr(knowledge, "search_medlineplus", search)
+    result = client.post("/api/knowledge/search", headers=headers, json={"query": "blood pressure"})
+    assert result.status_code == 200, result.text
+    assert result.headers["cache-control"] == "private, no-store"
+    assert sent_queries == ["blood pressure"]
+    assert result.json() == [{
+        "title": "Blood Pressure",
+        "summary": "A public health topic.",
+        "url": "https://medlineplus.gov/bloodpressure.html",
+        "source": "MedlinePlus.gov",
+    }]
+
+    def unavailable(query):
+        raise MedicalKnowledgeUnavailable("Source unavailable")
+
+    monkeypatch.setattr(knowledge, "search_medlineplus", unavailable)
+    response = client.post("/api/knowledge/search", headers=headers, json={"query": "blood pressure"})
+    assert response.status_code == 503
+    assert response.json()["detail"] == "Source unavailable"
+
+
+def test_medlineplus_response_is_sanitized_and_links_are_restricted():
+    from app.services.medlineplus_service import _parse_topics
+
+    xml = b"""<?xml version="1.0"?>
+    <nlmSearchResult><list>
+      <document url="https://medlineplus.gov/healthyaging.html" title="Healthy &amp; Aging"
+        snippet="Learn about &lt;b&gt;healthy aging&lt;/b&gt;.">
+        <content name="title">Healthy &amp; Aging</content>
+        <content name="snippet">Learn about &lt;b&gt;healthy aging&lt;/b&gt;.</content>
+      </document>
+      <document url="https://example.org/fake.html" title="Untrusted result"
+        snippet="Should not be included." />
+      <document url="http://medlineplus.gov/insecure.html" title="Insecure result"
+        snippet="Should not be included." />
+    </list></nlmSearchResult>"""
+
+    topics = _parse_topics(xml)
+    assert len(topics) == 1
+    assert topics[0].title == "Healthy & Aging"
+    assert topics[0].summary == "Learn about healthy aging."
+    assert topics[0].url == "https://medlineplus.gov/healthyaging.html"
+    assert topics[0].source == "MedlinePlus.gov"
+
+
+def test_medlineplus_search_caches_provider_response(monkeypatch):
+    from io import BytesIO
+
+    from app.services import medlineplus_service
+
+    with medlineplus_service._service_lock:
+        medlineplus_service._cache.clear()
+        medlineplus_service._request_times.clear()
+    calls = []
+    xml = b"""<nlmSearchResult><list><document
+      url="https://medlineplus.gov/sleepdisorders.html" title="Sleep Disorders"
+      snippet="Learn about sleep."><content name="title">Sleep Disorders</content>
+      <content name="snippet">Learn about sleep.</content></document></list></nlmSearchResult>"""
+
+    def fake_urlopen(request, timeout):
+        calls.append((request.full_url, timeout))
+        return BytesIO(xml)
+
+    monkeypatch.setattr(medlineplus_service, "urlopen", fake_urlopen)
+    first = medlineplus_service.search_medlineplus("  sleep   disorders ")
+    second = medlineplus_service.search_medlineplus("sleep disorders")
+    assert first == second
+    assert len(calls) == 1
+    assert "term=sleep+disorders" in calls[0][0]
+    assert calls[0][1] == 8
+    assert first[0].title == "Sleep Disorders"

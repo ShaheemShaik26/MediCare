@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import { ArrowDownToLine, AlertTriangle } from 'lucide-react'
 
 import { deleteAccount, downloadAccountExport } from '../lib/api'
 
@@ -46,28 +47,21 @@ export function AccountActions({ onDeleted }: Props) {
   }
 
   return (
-    <section className="card" aria-labelledby="account-actions-heading">
-      <h2 id="account-actions-heading" className="text-xl font-semibold mb-2">Account data</h2>
-      <p className="muted mb-4">Export a copy of your records and uploaded files, or permanently delete your account data.</p>
-      <button className="secondary-btn" type="button" onClick={() => void handleExport()} disabled={busy}>
-        Download my data
+    <section className="panel account-actions" aria-labelledby="account-actions-heading">
+      <div className="panel-heading">
+        <div><h2 id="account-actions-heading">Data controls</h2><p>Take a copy or remove your data.</p></div>
+      </div>
+      <button className="secondary-btn export-button" type="button" onClick={() => void handleExport()} disabled={busy}>
+        <ArrowDownToLine size={17} /> {busy ? 'Preparing…' : 'Export my data'}
       </button>
 
-      <form className="mt-6 space-y-4" onSubmit={(event) => void handleDelete(event)}>
-        <h3 className="font-semibold text-red-600">Delete account</h3>
-        <p className="text-sm muted">This permanently removes your account, health facts, and uploaded documents. Enter your password to confirm.</p>
-        <label className="label" htmlFor="delete-account-password">Current password</label>
-        <input
-          id="delete-account-password"
-          className="input"
-          type="password"
-          autoComplete="current-password"
-          value={password}
-          onChange={(event) => setPassword(event.target.value)}
-          required
-        />
-        <button className="secondary-btn" type="submit" disabled={busy || !password}>
-          Permanently delete my account
+      <form className="delete-account-form" onSubmit={(event) => void handleDelete(event)}>
+        <div className="danger-heading"><AlertTriangle size={17} /><h3>Delete account</h3></div>
+        <p>This permanently removes your account, health facts, and uploaded files.</p>
+        <label className="label" htmlFor="delete-account-password">Confirm with your password</label>
+        <input id="delete-account-password" className="input" type="password" autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} required />
+        <button className="danger-button" type="submit" disabled={busy || !password}>
+          Permanently delete account
         </button>
       </form>
 

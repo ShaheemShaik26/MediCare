@@ -5,10 +5,10 @@ import re
 import shutil
 import time
 from dataclasses import dataclass
+from datetime import date, datetime
 from io import BytesIO
 from math import ceil
 from pathlib import Path
-from typing import Iterable
 from uuid import uuid4
 
 from PIL import Image, UnidentifiedImageError
@@ -16,10 +16,10 @@ from pypdf import PdfReader
 from pypdf.errors import PdfReadError
 import pypdfium2 as pdfium
 import pytesseract
-from sqlalchemy.orm import Session
+import pymupdf
 
 from app.config import UPLOAD_DIR, settings
-from app.models.user import Document, MedicalFact, User
+from app.services.medical_ner_service import MedicalNerUnavailable, recognize_medical_entities
 
 
 class DocumentValidationError(ValueError):
@@ -36,6 +36,18 @@ class ExtractedDocument:
     ocr_page_numbers: set[int]
 
 
+@dataclass(frozen=True)
+class ExtractedFactCandidate:
+    fact_type: str
+    value: str
+    confidence: float
+    source_excerpt: str
+    page_number: int
+    event_date: date | None
+    numeric_value: float | None
+    unit: str | None
+
+
 MAX_UPLOAD_BYTES = settings.max_upload_size_mb * 1024 * 1024
 _SUPPORTED_EXTENSIONS = {".pdf", ".png", ".jpg", ".jpeg", ".txt", ".md"}
 _PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
@@ -45,11 +57,78 @@ _TESSERACT_TIMEOUT_SECONDS = 15
 _PDF_RENDER_SCALE = 2
 _MAX_RENDERED_PIXELS = 40_000_000
 
-_DATE_PATTERNS = [
-    r"\b(?:\d{4}-\d{2}-\d{2})\b",
-    r"\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)[a-z]*\s+\d{1,2},\s+\d{4}\b",
-    r"\b\d{1,2}/\d{1,2}/\d{2,4}\b",
-]
+_METADATA_DATE_PATTERN = re.compile(
+    r"(?i)\b(?:(?:(?:document|report|record|issued|created|printed|visit|service|collection|specimen|test|encounter)\s+date)|"
+    r"date\s+of\s+(?:document|report|record|visit|service|collection|specimen|test|encounter)|date(?!\s+of\s+birth))"
+    r"\s*[:\-]\s*(\d{4}-\d{2}-\d{2}|[A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4}|\d{1,2}/\d{1,2}/\d{2,4})"
+)
+_EVENT_DATE_PATTERN = re.compile(
+    r"(?i)\b(?:(?:event|visit|test|collection|specimen|service|encounter|procedure|admission|discharge)\s+date|"
+    r"date\s+of\s+(?:event|visit|test|collection|service|encounter|procedure|admission|discharge)|"
+    r"date\s+(?:collected|performed|recorded|admitted|discharged)|collected|performed|admitted|discharged)"
+    r"\s*[:\-]\s*(\d{4}-\d{2}-\d{2}|[A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4}|\d{1,2}/\d{1,2}/\d{2,4})"
+)
+_FACT_LABELS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("diagnosis", ("diagnosis", "diagnoses", "primary diagnosis", "secondary diagnosis", "final diagnosis", "condition", "medical condition")),
+    ("symptom", ("symptom", "symptoms")),
+    ("medication", ("medication", "medications", "current medication", "current medications", "medicine", "medicines", "prescription", "prescriptions", "drug", "drugs")),
+    ("allergy", ("allergy", "allergies", "drug allergy", "drug allergies", "allergy status")),
+    ("lab", ("lab", "test", "tests", "result", "results", "measurement", "measurements", "hba1c", "a1c", "glucose", "hemoglobin", "haemoglobin", "hematocrit", "haematocrit", "blood pressure", "bp", "ldl", "hdl", "cholesterol", "total cholesterol", "triglycerides", "creatinine", "egfr", "bun", "wbc", "rbc", "platelet", "platelets", "sodium", "potassium", "chloride", "bicarbonate", "calcium", "alt", "ast", "tsh", "vitamin d", "bmi", "weight", "height", "temperature", "heart rate", "pulse", "respiratory rate", "oxygen saturation", "spo2")),
+    ("procedure", ("procedure", "procedures", "surgery", "surgeries", "hospitalization", "hospitalizations", "visit", "visits")),
+    ("provider", ("provider", "providers", "doctor", "doctors", "physician", "physicians", "facility", "facilities", "clinic", "clinics")),
+    ("lifestyle_activity", ("exercise", "exercise frequency", "physical activity", "activity", "activity level")),
+    ("lifestyle_diet", ("diet", "nutrition")),
+    ("lifestyle_tobacco", ("tobacco use", "smoking")),
+    ("lifestyle_alcohol", ("alcohol use", "alcohol")),
+    ("lifestyle_sleep", ("sleep duration", "sleep hours", "sleep")),
+)
+_LABEL_TO_TYPE = {
+    label: fact_type
+    for fact_type, labels in _FACT_LABELS
+    for label in labels
+}
+_ALL_FACT_LABELS = "|".join(
+    re.escape(label)
+    for label in sorted((label for _, labels in _FACT_LABELS for label in labels), key=len, reverse=True)
+)
+_FACT_PATTERN = re.compile(
+    rf"(?i)(?<![\w])(?P<label>{_ALL_FACT_LABELS})\s*[:=\-–]\s*"
+    rf"(?P<value>.*?)(?=\s+(?:{_ALL_FACT_LABELS})\s*[:=\-–]|$)"
+)
+_SENTENCE_BOUNDARY_PATTERN = re.compile(r"(?<=[.!?])\s+(?=[A-Z])")
+_MEASUREMENT_PATTERN = re.compile(
+    r"^[<>≤≥]?\s*([+-]?\d+(?:\.\d+)?)\s*"
+    r"(mmol/mol|mg/dL|mmol/L|g/dL|mg/L|mL/min(?:/1\.73\s*m2)?|"
+    r"(?:[x×]\s*)?10\^(?:9|12)/L|mmHg|bpm|kg|lb|cm|mm|mL|mcg|µg|mg|g|%|°C|°F)$",
+    re.IGNORECASE,
+)
+_LAB_ROW_LABELS = (
+    "total cholesterol", "blood pressure", "oxygen saturation", "vitamin d",
+    "triglycerides", "creatinine", "hemoglobin", "haemoglobin", "platelets",
+    "respiratory rate", "total cholesterol", "blood pressure", "oxygen saturation",
+    "hematocrit", "haematocrit", "vitamin d", "triglycerides", "creatinine",
+    "hemoglobin", "haemoglobin", "platelets", "temperature", "heart rate",
+    "bicarbonate", "glucose", "hba1c", "cholesterol", "potassium", "chloride",
+    "sodium", "calcium", "egfr", "tsh", "weight", "height", "spo2", "bmi",
+    "wbc", "rbc", "ldl", "hdl", "bun", "alt", "ast", "pulse", "bp", "a1c",
+)
+_LAB_ROW_PATTERN = re.compile(
+    rf"(?i)^\s*(?P<label>{'|'.join(re.escape(label) for label in _LAB_ROW_LABELS)})"
+    r"(?:\s*[:=]\s*|\s+)(?P<value>\S(?:.*\S)?)\s*$"
+)
+_NER_FACT_TYPES = {
+    "disease_disorder": "diagnosis",
+    "sign_symptom": "symptom",
+    "medication": "medication",
+    "diagnostic_procedure": "procedure",
+    "therapeutic_procedure": "procedure",
+    "clinical_event": "medical_event",
+    "other_event": "medical_event",
+}
+_NER_GENERIC_VALUES = {
+    "condition", "diagnosis", "disease", "disorder", "drug", "medication",
+    "medicine", "procedure", "symptom", "therapy",
+}
 
 
 def sanitize_filename(file_name: str) -> str:
@@ -115,10 +194,10 @@ def extract_document_metadata(text: str) -> dict[str, str | None]:
     if metadata["document_type"] is None:
         metadata["document_type"] = "Medical record"
 
-    for pattern in _DATE_PATTERNS:
-        match = re.search(pattern, text, flags=re.IGNORECASE)
+    for line in lines:
+        match = _METADATA_DATE_PATTERN.search(line)
         if match:
-            metadata["document_date"] = match.group(0)
+            metadata["document_date"] = match.group(1)
             break
 
     provider_match = re.search(r"(?i)(?:provider|doctor|physician|facility|clinic)[:\-]\s*([^\n]+)", text)
@@ -126,6 +205,77 @@ def extract_document_metadata(text: str) -> dict[str, str | None]:
         metadata["provider_name"] = provider_match.group(1).strip()
 
     return metadata
+
+
+def _parse_explicit_event_date(text: str) -> date | None:
+    dates = _explicit_event_dates(text)
+    return dates[0] if dates else None
+
+
+def _trim_fact_sentence(value: str) -> str:
+    for boundary in _SENTENCE_BOUNDARY_PATTERN.finditer(value):
+        preceding_text = value[:boundary.start()].rstrip()
+        if re.search(r"\b(?:Dr|Mr|Mrs|Ms|Prof)\.$", preceding_text, re.IGNORECASE):
+            continue
+        return preceding_text
+    return value.strip()
+
+
+def _is_duplicate_fact(candidate: str, existing: str) -> bool:
+    if candidate == existing or f" {candidate} " in f" {existing} " or f" {existing} " in f" {candidate} ":
+        return True
+    candidate_terms = set(candidate.split())
+    existing_terms = set(existing.split())
+    overlap = len(candidate_terms & existing_terms)
+    return bool(overlap) and overlap / min(len(candidate_terms), len(existing_terms)) >= 0.75
+
+
+def _entity_matches_context(entity: str, context: str) -> bool:
+    phrase_pattern = re.escape(entity).replace(r"\ ", r"\s+")
+    return bool(re.search(
+        rf"(?<![a-z0-9]){phrase_pattern}s?(?![a-z0-9])",
+        context,
+    ))
+
+
+def parse_measurement(value: str) -> tuple[float | None, str | None]:
+    measurement_text = value.rsplit(":", 1)[-1].strip() if ":" in value else value.strip()
+    match = _MEASUREMENT_PATTERN.fullmatch(measurement_text)
+    if not match:
+        return None, None
+    try:
+        numeric_value = float(match.group(1))
+    except ValueError:
+        return None, None
+    return numeric_value, match.group(2)
+
+
+def _parse_record_date(raw_date: str) -> date | None:
+    for date_format in (
+        "%Y-%m-%d",
+        "%b %d, %Y",
+        "%B %d, %Y",
+        "%b %d %Y",
+        "%B %d %Y",
+        "%m/%d/%Y",
+        "%m/%d/%y",
+    ):
+        try:
+            return datetime.strptime(raw_date, date_format).date()
+        except ValueError:
+            continue
+    return None
+
+
+def _explicit_event_dates(text: str) -> list[date]:
+    dates: list[date] = []
+    for line in text.splitlines():
+        match = _EVENT_DATE_PATTERN.search(line)
+        if match:
+            parsed = _parse_record_date(match.group(1).strip())
+            if parsed and parsed not in dates:
+                dates.append(parsed)
+    return dates
 
 
 def _get_ocr_engine() -> tuple[str, str] | None:
@@ -227,8 +377,20 @@ def extract_document_pages(content: bytes, content_type: str) -> ExtractedDocume
                 raise
             raise DocumentValidationError("The PDF is damaged or cannot be read.") from exc
         try:
-            pages = [page.extract_text() or "" for page in reader.pages]
-        except (PdfReadError, OSError, ValueError) as exc:
+            with pymupdf.open(stream=content, filetype="pdf") as pdf_document:
+                pages = []
+                for page in pdf_document:
+                    text = page.get_text("text", sort=True) or ""
+                    table_rows = []
+                    for table in page.find_tables().tables:
+                        for row in table.extract():
+                            cells = [str(cell).strip() for cell in row if cell and str(cell).strip()]
+                            if len(cells) > 1:
+                                table_rows.append("\t".join(cells))
+                    if table_rows:
+                        text = "\n".join([text.rstrip(), *table_rows]).strip()
+                    pages.append(text)
+        except (pymupdf.FileDataError, OSError, RuntimeError, ValueError) as exc:
             raise DocumentValidationError("Text could not be extracted from this PDF.") from exc
         blank_page_numbers = [number for number, text in enumerate(pages, start=1) if not text.strip()]
         return ExtractedDocument(
@@ -253,51 +415,99 @@ def extract_document_pages(content: bytes, content_type: str) -> ExtractedDocume
     raise DocumentValidationError("Unsupported document type.")
 
 
-def extract_facts_from_text(
+def extract_fact_candidates(
     text: str,
-    document: Document,
-    user: User,
-    db: Session,
     page_number: int = 1,
     is_ocr: bool = False,
-) -> Iterable[MedicalFact]:
+) -> list[ExtractedFactCandidate]:
     if not text.strip():
         return []
 
-    patterns = {
-        "diagnosis": r"(?i)(diagnosis|diagnoses|condition)[:\-]\s*([^\n]+)",
-        "medication": r"(?i)(medication|medicine|prescription)[:\-]\s*([^\n]+)",
-        "allergy": r"(?i)(allergy|allergies)[:\-]\s*([^\n]+)",
-        "lab": r"(?i)(lab|test|result)[:\-]\s*([^\n]+)",
-        "procedure": r"(?i)(procedure|hospitalization|visit)[:\-]\s*([^\n]+)",
-        "provider": r"(?i)(provider|doctor|physician|facility|clinic)[:\-]\s*([^\n]+)",
-    }
+    candidates: list[ExtractedFactCandidate] = []
+    page_event_dates = _explicit_event_dates(text)
+    page_event_date = page_event_dates[0] if len(page_event_dates) == 1 else None
+    current_event_date = page_event_date
+    for line in text.splitlines():
+        line_event_date = _parse_explicit_event_date(line)
+        if line_event_date:
+            current_event_date = line_event_date
+        matches = [
+            (match.group("label").strip(), _trim_fact_sentence(match.group("value")).rstrip(";,"))
+            for match in _FACT_PATTERN.finditer(line)
+        ]
+        if not matches:
+            lab_match = _LAB_ROW_PATTERN.match(line)
+            if lab_match:
+                matches.append((lab_match.group("label").strip(), lab_match.group("value").strip().rstrip(";,.")))
 
-    created_facts: list[MedicalFact] = []
-    for fact_type, pattern in patterns.items():
-        matches = re.finditer(pattern, text)
-        for match in matches:
-            value = match.group(2).strip()
+        event_date = current_event_date
+        for label, value in matches:
             if not value:
                 continue
-            if fact_type == "medication":
-                value = re.sub(r"\s+on\s+\d{4}-\d{2}-\d{2}", "", value, flags=re.IGNORECASE)
-            excerpt = match.group(0).strip()[:220]
-            fact = MedicalFact(
-                owner_id=user.id,
-                document_id=document.id,
+            normalized_label = label.lower()
+            fact_type = _LABEL_TO_TYPE[normalized_label]
+            if fact_type == "lab" and normalized_label not in {
+                "lab", "test", "tests", "result", "results", "measurement", "measurements",
+            }:
+                value = f"{label}: {value}"
+            numeric_value, unit = parse_measurement(value) if fact_type == "lab" else (None, None)
+            excerpt = line.strip()[:220]
+            candidates.append(ExtractedFactCandidate(
                 fact_type=fact_type,
                 value=value,
-                status="unreviewed",
                 confidence=0.55,
                 source_excerpt=f"OCR text: {excerpt}" if is_ocr else excerpt,
                 page_number=page_number,
-            )
-            db.add(fact)
-            created_facts.append(fact)
+                event_date=event_date,
+                numeric_value=numeric_value,
+                unit=unit,
+            ))
 
-    db.flush()
-    return created_facts
+    if settings.medical_ner_enabled:
+        try:
+            entities = recognize_medical_entities(text)
+        except MedicalNerUnavailable as exc:
+            raise DocumentProcessingError(str(exc)) from exc
+
+        existing_facts = {
+            (candidate.fact_type, re.sub(r"[^a-z0-9]+", " ", candidate.value.lower()).strip())
+            for candidate in candidates
+        }
+        for entity in entities:
+            fact_type = _NER_FACT_TYPES.get(entity.label.casefold())
+            value = entity.text.strip()
+            normalized_value = re.sub(r"[^a-z0-9]+", " ", value.lower()).strip()
+            normalized_context = re.sub(r"[^a-z0-9]+", " ", entity.context.lower()).strip()
+            is_duplicate = any(
+                existing_type == fact_type
+                and _is_duplicate_fact(normalized_value, existing_value)
+                for existing_type, existing_value in existing_facts
+            )
+            if (
+                fact_type is None
+                or entity.score < settings.medical_ner_min_score
+                or len(normalized_value) < 3
+                or not _entity_matches_context(normalized_value, normalized_context)
+                or normalized_value in _NER_GENERIC_VALUES
+                or is_duplicate
+            ):
+                continue
+            excerpt = entity.context[:200]
+            source_prefix = "OCR + AI suggestion" if is_ocr else "AI suggestion"
+            candidate = ExtractedFactCandidate(
+                fact_type=fact_type,
+                value=value[:2000],
+                confidence=entity.score,
+                source_excerpt=f"{source_prefix}: {excerpt}",
+                page_number=page_number,
+                event_date=_parse_explicit_event_date(entity.context) if len(page_event_dates) > 1 else page_event_date,
+                numeric_value=None,
+                unit=None,
+            )
+            candidates.append(candidate)
+            existing_facts.add((fact_type, normalized_value))
+
+    return candidates
 
 
 def save_document_to_private_store(file_name: str, content: bytes, user_id: int) -> Path:
